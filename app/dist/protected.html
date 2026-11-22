@@ -1,0 +1,6 @@
+<!doctype html><html lang="ko"><head><meta charset="utf-8"><title>PROTECTED</title>
+<style>html,body{margin:0;height:100%;background:#d61f1f;color:#fff;font:700 32px/1.3 "Segoe UI",-apple-system,sans-serif;display:grid;place-items:center;text-align:center}</style>
+</head><body><div>PROTECTED<br><span style="font-size:18px">contentProtected: true<br>보호할 내용 자리</span><br><span id="clock" style="font-size:18px"></span></div>
+<!-- 녹화 시험에서 화면이 계속 바뀌어 프레임이 들어오도록 시계를 돌린다. -->
+<script>setInterval(() => { document.getElementById("clock").textContent = new Date().toISOString().slice(11, 23); }, 50);</script>
+</body></html>
