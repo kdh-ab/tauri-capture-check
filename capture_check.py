@@ -36,10 +36,12 @@ WINDOW_WAIT_SECONDS = 90
 PAINT_SETTLE_SECONDS = 5
 STREAM_SECONDS = 3.0
 STREAM_MAX_FRAMES = 60
-CLIPBOARD_WAIT_SECONDS = 5
+CLIPBOARD_WAIT_SECONDS = 8
+SNIP_OVERLAY_SECONDS = 3
 WDA_NAMES = {0x0: "WDA_NONE", 0x1: "WDA_MONITOR", 0x11: "WDA_EXCLUDEFROMCAPTURE"}
-VK_SNAPSHOT = 0x2C
+VK_SNAPSHOT, VK_LWIN, VK_SHIFT, VK_S, VK_ESCAPE = 0x2C, 0x5B, 0x10, 0x53, 0x1B
 KEYEVENTF_KEYUP = 0x2
+MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x2, 0x4
 PW_RENDERFULLCONTENT = 0x2
 SM_CXSCREEN, SM_CYSCREEN, SM_REMOTESESSION = 0, 1, 0x1000
 
@@ -65,6 +67,10 @@ user32.GetSystemMetrics.argtypes = [ctypes.c_int]
 user32.GetSystemMetrics.restype = ctypes.c_int
 user32.keybd_event.argtypes = [wt.BYTE, wt.BYTE, wt.DWORD, ctypes.c_size_t]
 user32.keybd_event.restype = None
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.SetCursorPos.restype = wt.BOOL
+user32.mouse_event.argtypes = [wt.DWORD, wt.DWORD, wt.DWORD, wt.DWORD, ctypes.c_size_t]
+user32.mouse_event.restype = None
 user32.OpenClipboard.argtypes = [wt.HWND]
 user32.OpenClipboard.restype = wt.BOOL
 user32.EmptyClipboard.restype = wt.BOOL
@@ -169,7 +175,7 @@ def environment() -> dict[str, object]:
     session = wt.DWORD()
     kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(session))
     versions = {}
-    for package in ("mss", "dxcam", "windows-capture", "numpy", "pillow"):
+    for package in ("mss", "dxcam", "windows-capture", "numpy", "pillow", "psutil"):
         try:
             versions[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
@@ -195,20 +201,97 @@ def gdi_screen() -> np.ndarray:
         return np.asarray(shot)[..., [2, 1, 0]]
 
 
-def printscreen_key() -> np.ndarray:
-    """PrintScreen 키를 눌러 클립보드에 들어온 화면을 읽는다."""
+def press(*keys: int) -> None:
+    """키를 차례로 누르고 거꾸로 뗀다(조합키)."""
+    for key in keys:
+        user32.keybd_event(key, 0, 0, 0)
+    for key in reversed(keys):
+        user32.keybd_event(key, 0, KEYEVENTF_KEYUP, 0)
+
+
+def drag(x0: int, y0: int, x1: int, y1: int, steps: int = 25) -> None:
+    user32.SetCursorPos(x0, y0)
+    time.sleep(0.3)
+    user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+    for i in range(1, steps + 1):
+        user32.SetCursorPos(x0 + (x1 - x0) * i // steps, y0 + (y1 - y0) * i // steps)
+        time.sleep(0.03)
+    user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+
+def clear_clipboard() -> None:
     if user32.OpenClipboard(None):
         user32.EmptyClipboard()
         user32.CloseClipboard()
-    user32.keybd_event(VK_SNAPSHOT, 0, 0, 0)
-    user32.keybd_event(VK_SNAPSHOT, 0, KEYEVENTF_KEYUP, 0)
-    deadline = time.monotonic() + CLIPBOARD_WAIT_SECONDS
+
+
+def read_clipboard_image(seconds: float) -> np.ndarray | None:
+    deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        image = ImageGrab.grabclipboard()
+        try:
+            image = ImageGrab.grabclipboard()
+        except OSError:
+            image = None  # 다른 프로그램이 클립보드를 쓰는 중
         if isinstance(image, Image.Image):
             return np.asarray(image.convert("RGB"))
         time.sleep(0.2)
-    raise RuntimeError("PrintScreen을 눌렀지만 클립보드에 화면이 들어오지 않았습니다.")
+    return None
+
+
+def snip(*keys: int) -> np.ndarray:
+    """
+    사람이 하듯 단축키로 캡처한다. 예전 PrintScreen처럼 클립보드에 바로 들어오면 그대로 쓰고,
+    캡처 도구(Snipping Tool)의 영역 선택 화면이 뜨면 화면 전체를 마우스로 끌어 선택한다.
+    """
+    clear_clipboard()
+    press(*keys)
+    image = read_clipboard_image(SNIP_OVERLAY_SECONDS)
+    if image is None:
+        width, height = user32.GetSystemMetrics(SM_CXSCREEN), user32.GetSystemMetrics(SM_CYSCREEN)
+        drag(1, 1, width - 2, height - 2)
+        image = read_clipboard_image(CLIPBOARD_WAIT_SECONDS)
+    press(VK_ESCAPE)  # 선택 화면이 남아 있으면 닫는다.
+    if image is None:
+        raise RuntimeError("단축키를 눌렀지만 클립보드에 캡처가 들어오지 않았습니다.")
+    return image
+
+
+WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+user32.EnumWindows.argtypes = [WNDENUMPROC, wt.LPARAM]
+user32.EnumWindows.restype = wt.BOOL
+user32.IsWindowVisible.argtypes = [wt.HWND]
+user32.IsWindowVisible.restype = wt.BOOL
+user32.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+user32.GetWindowTextW.restype = ctypes.c_int
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+
+
+def visible_windows(limit: int = 15) -> list[dict[str, object]]:
+    """화면에 보이는 최상위 창을 위에서부터(z-order) 적는다. 측정을 가린 창을 찾는 데 쓴다."""
+    import psutil
+
+    found: list[dict[str, object]] = []
+
+    def callback(hwnd, _lparam):
+        rect = wt.RECT()
+        if not user32.IsWindowVisible(hwnd) or not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return True
+        if rect.right - rect.left <= 0 or rect.bottom - rect.top <= 0:
+            return True
+        title = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, title, 256)
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        try:
+            process = psutil.Process(pid.value).name()
+        except psutil.Error:
+            process = "?"
+        found.append({"title": title.value, "process": process, "rect": [rect.left, rect.top, rect.right, rect.bottom]})
+        return len(found) < limit
+
+    user32.EnumWindows(WNDENUMPROC(callback), 0)
+    return found
 
 
 def print_window(hwnd: int) -> np.ndarray:
@@ -381,12 +464,16 @@ def measure_window_streams(out: Path, hwnds: dict[str, int]) -> Result:
     return result
 
 
-def summary_markdown(env: dict[str, object], windows: dict[str, dict[str, object]], results: list[Result]) -> str:
+def summary_markdown(
+    env: dict[str, object], windows: dict[str, dict[str, object]], results: list[Result], stack: list[dict[str, object]]
+) -> str:
+    top = ", ".join(f"{w['title'] or '(제목 없음)'}[{w['process']}]" for w in stack[:5])
     lines = [
         f"### Windows 캡처 차단 실측 — {env['os']} (build {env['build']})",
         "",
         f"- 화면 {env['screen'][0]}×{env['screen'][1]}, 세션 {env['session_id']}, 원격 세션 {env['remote_session']}",
         f"- 보호 창 display affinity: **{windows[PROTECTED_TITLE]['affinity']}**, 비교 창: {windows[CONTROL_TITLE]['affinity']}",
+        f"- 측정 시작 때 맨 위 창(위에서부터): {top}",
         "",
         "| 캡처 경로 | 보호 창(빨강 점) | 비교 창(초록 점) | 판정 |",
         "|---|---:|---:|---|",
@@ -416,9 +503,9 @@ def main() -> int:
     time.sleep(PAINT_SETTLE_SECONDS)
     windows = {title: window_info(hwnd) for title, hwnd in hwnds.items()}
 
+    stack = visible_windows()
     results = [
         measure_still(out, "gdi_screen", "화면 전체 복사(GDI BitBlt)", gdi_screen),
-        measure_still(out, "printscreen", "PrintScreen 키(클립보드)", printscreen_key),
         measure_per_window(out, "print_window", "창 단위 캡처(PrintWindow)", print_window, hwnds),
     ]
     try:
@@ -430,10 +517,13 @@ def main() -> int:
         results.append(failed)
     results.append(measure_stream(out, "wgc_monitor", "Windows.Graphics.Capture 화면 녹화 3초", wgc_stream))
     results.append(measure_window_streams(out, hwnds))
+    # 실제 도구 시험은 맨 뒤에 한다. 캡처 도구의 선택 화면이 남으면 다른 측정을 가리기 때문이다.
+    results.append(measure_still(out, "printscreen", "PrintScreen 키(캡처 도구 또는 클립보드)", lambda: snip(VK_SNAPSHOT)))
+    results.append(measure_still(out, "snip", "캡처 도구 단축키(Win+Shift+S)", lambda: snip(VK_LWIN, VK_SHIFT, VK_S)))
 
-    report = {"environment": env, "windows": windows, "results": [asdict(r) for r in results]}
+    report = {"environment": env, "windows": windows, "visible_windows": stack, "results": [asdict(r) for r in results]}
     (out / "results.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    summary = summary_markdown(env, windows, results)
+    summary = summary_markdown(env, windows, results, stack)
     (out / "summary.md").write_text(summary, encoding="utf-8")
     print(summary)
     return 0
